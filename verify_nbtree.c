@@ -25,7 +25,13 @@
  */
 #include "postgres.h"
 
+#if (PG_VERSION_NUM != 90204)
+/* 
+ * Tuple struct defs was splited from htup.h to htup_details.h
+ * in the initial commit of htup_details.h (commit c219d9b).
+ */
 #include "access/htup_details.h"
+#endif
 #include "access/nbtree.h"
 #include "access/transam.h"
 #include "bloomfilter.h"
@@ -45,6 +51,19 @@ PG_MODULE_MAGIC;
  * block per level, which is bound by the range of BlockNumber:
  */
 #define InvalidBtreeLevel	((uint32) InvalidBlockNumber)
+
+#if PG_VERSION_NUM == 90204
+/*
+ * TupleDescAttr was added in tupdesc.h in commit
+ * 2cd7084 (2017/08/21 3:19:07). 
+ * In addition, the definition of TupleDescAttr has been changed along with 
+ * the definition change of the structure tupleDesc
+ * in commit c629324 (2017/08/21 3:19:12).
+ * The former definition is suitable for ver.9.2.4.
+ */
+ /* Accessor for the i'th attribute of tupdesc. */
+#define TupleDescAttr(tupdesc, i) ((tupdesc)->attrs[(i)])
+#endif
 
 /*
  * State associated with verifying a B-Tree index
@@ -724,7 +743,32 @@ nextpage:
 		 * an incomplete page split.  This can go stale immediately in
 		 * !readonly case.
 		 */
+#if (PG_VERSION_NUM != 90204)
+		/*
+		 * In ver.9.2.x, the definition of macro "P_INCOMPLETE_SPLIT(opaque)" does not exist.
+		 * This macro was added in nbtree.h in commit 40dae7e (2014/03/19 3:12:58). 
+		 * This commit has been adopted since ver.9.4.
+		 * 
+		 * src/backend/access/nbtree/README noted the following:
+		 *
+		 *   Before 9.4, we used to keep track of incomplete splits and page deletions
+		 *   during recovery and finish them immediately at end of recovery, instead of
+		 *   doing it lazily at the next insertion or vacuum.  However, that made the
+		 *   recovery much more complicated, and only fixed the problem when crash
+		 *   recovery was performed.  An incomplete split can also occur if an otherwise
+		 *   recoverable error, like out-of-memory or out-of-disk-space, happens while
+		 *   inserting the downlink to the parent.
+		 * 
+		 * Originally state->rightsplit is evaluated only in bt_downlink_missing_check(). 
+		 * If state->rightsplit is true, the target page is judged to be normal and 
+		 * remaining checks in bt_downlink_missing_check() are not executed.
+		 * 
+		 * However, in ver.9.2.x, incomplete split state is an abnormal state.
+		 * Therefore, evaluation of state->rightsplit in bt_downlink_missing_check()
+		 * is disabled by fixing state->rightsplit to false.  
+		 */
 		state->rightsplit = P_INCOMPLETE_SPLIT(opaque);
+#endif
 
 		leftcurrent = current;
 		current = opaque->btpo_next;
@@ -819,8 +863,19 @@ bt_target_page_check(BtreeCheckState *state)
 					 errdetail_internal("Index tid=(%u,%u) tuple size=%zu lp_len=%u page lsn=%X/%X.",
 										state->targetblock, offset,
 										tupsize, ItemIdGetLength(itemid),
+#if PG_VERSION_NUM == 90204
+										/*
+										 * In commit 0ab9d1c (2012/06/25 0:51:37), 
+										 * the type of variable XLogRecPtr was changed from a structure to
+										 * a 64-bit int type in xlogdefs.h. 
+										 * The older definition is suitable for ver.9.2.x.
+										 */
+										state->targetlsn.xlogid,
+										state->targetlsn.xrecoff),
+#else
 										(uint32) (state->targetlsn >> 32),
 										(uint32) state->targetlsn),
+#endif
 					 errhint("This could be a torn page problem.")));
 
 		/* Fingerprint downlink blocks in heapallindexed + readonly case */
@@ -879,6 +934,24 @@ bt_target_page_check(BtreeCheckState *state)
 		if (!P_RIGHTMOST(topaque) &&
 			!invariant_leq_offset(state, skey, P_HIKEY))
 		{
+#if PG_VERSION_NUM == 90204
+			/*
+			 * In ver.9.2.4, the definition of psprintf() does not exist.
+			 * This function was added in commit 09a89cb.
+			 * Therefore, snprintf() is applied instead of psprintf().
+			 * In all cases in this file, buffer size is set to 32 bytes because
+			 * the maximum number of bytes theoretically required is 19 bytes 
+			 * (normal characters = 3 bytes, uint32 converted to decimal <= 10 bytes,
+			 * uint16 converted to decimal <= 5 bytes, 
+			 * termination character = 1 byte).
+			 */
+			char	   itid[32],
+					   htid[32];
+			snprintf(itid, sizeof(itid), "(%u,%u)", state->targetblock, offset);
+			snprintf(htid, sizeof(htid), "(%u,%u)",
+							ItemPointerGetBlockNumber(&(itup->t_tid)),
+							ItemPointerGetOffsetNumber(&(itup->t_tid)));
+#else
 			char	   *itid,
 					   *htid;
 
@@ -886,6 +959,7 @@ bt_target_page_check(BtreeCheckState *state)
 			htid = psprintf("(%u,%u)",
 							ItemPointerGetBlockNumber(&(itup->t_tid)),
 							ItemPointerGetOffsetNumber(&(itup->t_tid)));
+#endif
 
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -895,8 +969,13 @@ bt_target_page_check(BtreeCheckState *state)
 										itid,
 										P_ISLEAF(topaque) ? "heap" : "index",
 										htid,
+#if PG_VERSION_NUM == 90204
+										state->targetlsn.xlogid,
+										state->targetlsn.xrecoff)));
+#else
 										(uint32) (state->targetlsn >> 32),
 										(uint32) state->targetlsn)));
+#endif
 		}
 
 		/*
@@ -909,6 +988,19 @@ bt_target_page_check(BtreeCheckState *state)
 			!invariant_leq_offset(state, skey,
 								  OffsetNumberNext(offset)))
 		{
+#if PG_VERSION_NUM == 90204
+			char	   itid[32],
+					   htid[32],
+					   nitid[32],
+					   nhtid[32];
+
+			snprintf(itid, sizeof(itid), "(%u,%u)", state->targetblock, offset);
+			snprintf(htid, sizeof(htid), "(%u,%u)",
+							ItemPointerGetBlockNumber(&(itup->t_tid)),
+							ItemPointerGetOffsetNumber(&(itup->t_tid)));
+			snprintf(nitid, sizeof(nitid), "(%u,%u)", state->targetblock,
+							 OffsetNumberNext(offset));
+#else
 			char	   *itid,
 					   *htid,
 					   *nitid,
@@ -920,13 +1012,20 @@ bt_target_page_check(BtreeCheckState *state)
 							ItemPointerGetOffsetNumber(&(itup->t_tid)));
 			nitid = psprintf("(%u,%u)", state->targetblock,
 							 OffsetNumberNext(offset));
+#endif
 
 			/* Reuse itup to get pointed-to heap location of second item */
 			itemid = PageGetItemId(state->target, OffsetNumberNext(offset));
 			itup = (IndexTuple) PageGetItem(state->target, itemid);
+#if PG_VERSION_NUM == 90204
+			snprintf(nhtid, sizeof(nhtid), "(%u,%u)",
+							 ItemPointerGetBlockNumber(&(itup->t_tid)),
+							 ItemPointerGetOffsetNumber(&(itup->t_tid)));
+#else
 			nhtid = psprintf("(%u,%u)",
 							 ItemPointerGetBlockNumber(&(itup->t_tid)),
 							 ItemPointerGetOffsetNumber(&(itup->t_tid)));
+#endif
 
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -941,8 +1040,13 @@ bt_target_page_check(BtreeCheckState *state)
 										nitid,
 										P_ISLEAF(topaque) ? "heap" : "index",
 										nhtid,
+#if PG_VERSION_NUM == 90204
+										state->targetlsn.xlogid,
+										state->targetlsn.xrecoff)));
+#else
 										(uint32) (state->targetlsn >> 32),
 										(uint32) state->targetlsn)));
+#endif
 		}
 
 		/*
@@ -999,8 +1103,13 @@ bt_target_page_check(BtreeCheckState *state)
 								RelationGetRelationName(state->rel)),
 						 errdetail_internal("Last item on page tid=(%u,%u) page lsn=%X/%X.",
 											state->targetblock, offset,
+#if PG_VERSION_NUM == 90204
+											state->targetlsn.xlogid,
+											state->targetlsn.xrecoff)));
+#else
 											(uint32) (state->targetlsn >> 32),
 											(uint32) state->targetlsn)));
+#endif
 			}
 		}
 
@@ -1341,8 +1450,13 @@ bt_downlink_check(BtreeCheckState *state, BlockNumber childblock,
 						RelationGetRelationName(state->rel)),
 				 errdetail_internal("Parent block=%u child block=%u parent page lsn=%X/%X.",
 									state->targetblock, childblock,
+#if PG_VERSION_NUM == 90204
+									state->targetlsn.xlogid,
+									state->targetlsn.xrecoff)));
+#else
 									(uint32) (state->targetlsn >> 32),
 									(uint32) state->targetlsn)));
+#endif
 
 	for (offset = P_FIRSTDATAKEY(copaque);
 		 offset <= maxoffset;
@@ -1365,8 +1479,13 @@ bt_downlink_check(BtreeCheckState *state, BlockNumber childblock,
 							RelationGetRelationName(state->rel)),
 					 errdetail_internal("Parent block=%u child index tid=(%u,%u) parent page lsn=%X/%X.",
 										state->targetblock, childblock, offset,
+#if PG_VERSION_NUM == 90204
+										state->targetlsn.xlogid,
+										state->targetlsn.xrecoff)));
+#else
 										(uint32) (state->targetlsn >> 32),
 										(uint32) state->targetlsn)));
+#endif
 	}
 
 	pfree(child);
@@ -1432,8 +1551,13 @@ bt_downlink_missing_check(BtreeCheckState *state)
 				 errdetail_internal("Block=%u level=%u left sibling=%u page lsn=%X/%X.",
 									state->targetblock, topaque->btpo.level,
 									topaque->btpo_prev,
+#if PG_VERSION_NUM == 90204
+									state->targetlsn.xlogid,
+									state->targetlsn.xrecoff)));
+#else
 									(uint32) (state->targetlsn >> 32),
 									(uint32) state->targetlsn)));
+#endif
 		return;
 	}
 
@@ -1460,8 +1584,13 @@ bt_downlink_missing_check(BtreeCheckState *state)
 						RelationGetRelationName(state->rel)),
 				 errdetail_internal("Block=%u page lsn=%X/%X.",
 									state->targetblock,
+#if PG_VERSION_NUM == 90204
+									state->targetlsn.xlogid,
+									state->targetlsn.xrecoff)));
+#else
 									(uint32) (state->targetlsn >> 32),
 									(uint32) state->targetlsn)));
+#endif
 
 	/* Descend from the target page, which is an internal page */
 	elog(DEBUG1, "checking for interrupted multi-level deletion due to missing downlink in index \"%s\"",
@@ -1526,8 +1655,13 @@ bt_downlink_missing_check(BtreeCheckState *state)
 								 RelationGetRelationName(state->rel)),
 				 errdetail_internal("Top parent/target block=%u leaf block=%u top parent/target lsn=%X/%X.",
 									state->targetblock, childblk,
+#if PG_VERSION_NUM == 90204
+									state->targetlsn.xlogid,
+									state->targetlsn.xrecoff)));
+#else
 									(uint32) (state->targetlsn >> 32),
 									(uint32) state->targetlsn)));
+#endif
 
 	/*
 	 * Iff leaf page is half-dead, its high key top parent link should point to
@@ -1553,8 +1687,13 @@ bt_downlink_missing_check(BtreeCheckState *state)
 					RelationGetRelationName(state->rel)),
 			 errdetail_internal("Block=%u level=%u page lsn=%X/%X.",
 								state->targetblock, topaque->btpo.level,
+#if PG_VERSION_NUM == 90204
+								state->targetlsn.xlogid,
+								state->targetlsn.xrecoff)));
+#else
 								(uint32) (state->targetlsn >> 32),
 								(uint32) state->targetlsn)));
+#endif
 }
 
 /*
