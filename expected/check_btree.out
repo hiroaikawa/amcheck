@@ -94,6 +94,7 @@ COMMIT;
 --
 INSERT INTO delete_test_table SELECT i, 1, 2, 3 FROM generate_series(1,80000) i;
 ALTER TABLE delete_test_table ADD PRIMARY KEY (a,b,c,d);
+NOTICE:  ALTER TABLE / ADD PRIMARY KEY will create implicit index "delete_test_table_pkey" for table "delete_test_table"
 DELETE FROM delete_test_table WHERE a > 40000;
 VACUUM delete_test_table;
 DELETE FROM delete_test_table WHERE a > 10;
